@@ -75,6 +75,18 @@ Only for Node: `npm install`.
 
 Then `npm run start` / `npm run start:deno` / `npm run start:bun`.
 
+#### Environment Variables
+
+You can customize the behavior using environment variables:
+
+- `GEMINI_BASE_URL`: Override the Gemini API base URL (default: `https://generativelanguage.googleapis.com`)
+- `PORT`: Override the server port (default: `8080`)
+
+Example:
+```sh
+GEMINI_BASE_URL=https://custom-api.example.com PORT=3000 npm run start
+```
+
 
 #### Dev mode (watch source changes)
 

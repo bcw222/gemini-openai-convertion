@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
 export default {
-  async fetch (request) {
+  async fetch (request, env) {
     if (request.method === "OPTIONS") {
       return handleOPTIONS();
     }
@@ -18,18 +18,19 @@ export default {
         }
       };
       const { pathname } = new URL(request.url);
+      const baseUrl = getBaseUrl(env);
       switch (true) {
         case pathname.endsWith("/chat/completions"):
           assert(request.method === "POST");
-          return handleCompletions(await request.json(), apiKey)
+          return handleCompletions(await request.json(), apiKey, baseUrl)
             .catch(errHandler);
         case pathname.endsWith("/embeddings"):
           assert(request.method === "POST");
-          return handleEmbeddings(await request.json(), apiKey)
+          return handleEmbeddings(await request.json(), apiKey, baseUrl)
             .catch(errHandler);
         case pathname.endsWith("/models"):
           assert(request.method === "GET");
-          return handleModels(apiKey)
+          return handleModels(apiKey, baseUrl)
             .catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
@@ -64,7 +65,7 @@ const handleOPTIONS = async () => {
   });
 };
 
-const BASE_URL = "https://generativelanguage.googleapis.com";
+const getBaseUrl = (env) => env?.GEMINI_BASE_URL || process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com";
 const API_VERSION = "v1beta";
 
 // https://github.com/googleapis/js-genai/blob/main/src/_api_client.ts#L21
@@ -75,8 +76,8 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
-async function handleModels (apiKey) {
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
+async function handleModels (apiKey, baseUrl) {
+  const response = await fetch(`${baseUrl}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
   });
   let { body } = response;
@@ -96,7 +97,7 @@ async function handleModels (apiKey) {
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "gemini-embedding-001";
-async function handleEmbeddings (req, apiKey) {
+async function handleEmbeddings (req, apiKey, baseUrl) {
   let modelFull, model;
   switch (true) {
     case typeof req.model !== "string":
@@ -115,7 +116,7 @@ async function handleEmbeddings (req, apiKey) {
   if (!Array.isArray(req.input)) {
     req.input = [ req.input ];
   }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${modelFull}:batchEmbedContents`, {
+  const response = await fetch(`${baseUrl}/${API_VERSION}/${modelFull}:batchEmbedContents`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify({
@@ -143,7 +144,7 @@ async function handleEmbeddings (req, apiKey) {
 }
 
 const DEFAULT_MODEL = "gemini-flash-latest";
-async function handleCompletions (req, apiKey) {
+async function handleCompletions (req, apiKey, baseUrl) {
   let model = req.model;
   switch (true) {
     case typeof model !== "string":
@@ -180,7 +181,7 @@ async function handleCompletions (req, apiKey) {
       body.tools.push({googleSearch: {}});
   }
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+  let url = `${baseUrl}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
   const response = await fetch(url, {
     method: "POST",
