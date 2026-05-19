@@ -159,7 +159,12 @@ async function handleCompletions (req, apiKey, baseUrl) {
       model = DEFAULT_MODEL;
   }
   let isV3 = model.startsWith("gemini-3");
+  let isThinkingModel = /^gemini-[23]\./.test(model) || isV3;
   let body = await transformRequest(req, isV3);
+  // Ensure thinking models include thoughts in the response
+  if (isThinkingModel && !body.generationConfig.thinkingConfig) {
+    body.generationConfig.thinkingConfig = { includeThoughts: true };
+  }
   const extra = req.extra_body?.google;
   if (extra) {
     if (extra.safety_settings) {
@@ -169,7 +174,7 @@ async function handleCompletions (req, apiKey, baseUrl) {
       body.cachedContent = extra.cached_content;
     }
     if (extra.thinking_config) {
-      body.generationConfig.thinkingConfig = extra.thinking_config;
+      body.generationConfig.thinkingConfig = { includeThoughts: true, ...extra.thinking_config };
     }
   }
   switch (true) {
@@ -314,10 +319,12 @@ const transformConfig = (req, isV3) => {
     }
   }
   if (req.reasoning_effort) {
-    cfg.thinkingConfig =
-      isV3
+    cfg.thinkingConfig = {
+      includeThoughts: true,
+      ...(isV3
         ? { thinkingLevel: thinkingLevelMap[req.reasoning_effort] ?? req.reasoning_effort }
-        : { thinkingBudget: thinkingBudgetMap[req.reasoning_effort] };
+        : { thinkingBudget: thinkingBudgetMap[req.reasoning_effort] }),
+    };
   }
   return cfg;
 };
@@ -410,13 +417,24 @@ const transformFnCalls = ({ tool_calls }) => {
   return parts;
 };
 
-const transformMsg = async ({ content, extra_content }) => {
+const transformMsg = async ({ content, reasoning_content, extra_content }) => {
   const thoughtSignature = extra_content?.google?.thought_signature;
   const parts = [];
+  // Add reasoning/thinking content as thought parts (for assistant messages round-trip)
+  if (reasoning_content) {
+    parts.push({ text: reasoning_content, thought: true });
+  }
   if (!Array.isArray(content)) {
     // system, user: string
     // assistant: string or null (Required unless tool_calls is specified.)
-    parts.push({ text: content, thoughtSignature });
+    if (content) {
+      parts.push({ text: content, thoughtSignature });
+    } else if (!parts.length) {
+      // empty assistant content with no reasoning — still need a text part
+      parts.push({ text: "", thoughtSignature });
+    } else if (thoughtSignature) {
+      parts[parts.length - 1].thoughtSignature = thoughtSignature;
+    }
     return parts;
   }
   // user:
@@ -486,9 +504,14 @@ const transformMessages = async (messages) => {
       default:
         throw new HttpError(`Unknown message role: "${item.role}"`, 400);
     }
+    const msgParts = item.tool_calls ? transformFnCalls(item) : await transformMsg(item);
+    // Merge reasoning_content thought parts into tool_calls parts
+    if (item.tool_calls && item.reasoning_content) {
+      msgParts.unshift({ text: item.reasoning_content, thought: true });
+    }
     contents.push({
       role: item.role,
-      parts: item.tool_calls ? transformFnCalls(item) : await transformMsg(item)
+      parts: msgParts
     });
   }
   if (system_instruction) {
@@ -545,12 +568,13 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
 const SEP = "\n\n|>";
 function transformCandidates (key, cand) {
   const message = { role: "assistant", content: [] };
+  let reasoning_content = [];
   let thought_signature;
   for (const part of cand.content?.parts ?? []) {
     if (part.functionCall) {
       const fc = part.functionCall;
       message.tool_calls ??= [];
-      const thought_signature = fc.thoughtSignature;
+      const fc_thought_signature = fc.thoughtSignature;
       message.tool_calls.push({
         id: fc.id ?? "call_" + generateId(),
         type: "function",
@@ -558,28 +582,22 @@ function transformCandidates (key, cand) {
           name: fc.name,
           arguments: JSON.stringify(fc.args),
         },
-        extra_content: thought_signature ? {google: { thought_signature }} : undefined,
+        extra_content: fc_thought_signature ? {google: { thought_signature: fc_thought_signature }} : undefined,
       });
     } else if (typeof part.text === "string") {
-      const len = message.content.length;
-      if (part.thought !== this.isThinking) {
-        this.isThinking = part.thought;
-        let prefix;
-        if (part.thought) {
-          prefix = "<thought>\n";
-        } else {
-          prefix = "</thought>\n\n";
-          if (len) {
-            message.content[len-1] = message.content[len-1].trimEnd() + "\n";
-          } else {
-            prefix += "\n";
-          }
+      if (part.thought) {
+        // thinking/reasoning content — emit as reasoning_content, not in content
+        if (reasoning_content.length) {
+          reasoning_content[reasoning_content.length - 1] += SEP;
         }
-        part.text = prefix + part.text;
-      } else if (len) {
-        message.content[len-1] += SEP;
+        reasoning_content.push(part.text);
+      } else {
+        const len = message.content.length;
+        if (len) {
+          message.content[len - 1] += SEP;
+        }
+        message.content.push(part.text);
       }
-      message.content.push(part.text);
       if (thought_signature && part.thoughtSignature) {
         throw new Error("Unexpected multiple thoughtSignature");
       }
@@ -588,7 +606,10 @@ function transformCandidates (key, cand) {
       throw new Error("Unexpected part type: " + JSON.stringify(part,2));
     }
   }
-  message.content = message.content.join("") ?? null;
+  message.content = message.content.join("") || null;
+  if (reasoning_content.length) {
+    message.reasoning_content = reasoning_content.join("");
+  }
   if (thought_signature) {
     message.extra_content = {google: { thought_signature }};
   }
@@ -727,7 +748,7 @@ function toOpenAiStream (line, controller) {
     }));
   }
   delete cand.delta.role;
-  if ("content" in cand.delta) { // prevent empty data (e.g. when MAX_TOKENS)
+  if ("content" in cand.delta || "reasoning_content" in cand.delta) { // prevent empty data (e.g. when MAX_TOKENS)
     controller.enqueue(sseline(obj));
   }
   cand.finish_reason = finish_reason;
