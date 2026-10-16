@@ -81,6 +81,7 @@ You can customize the behavior using environment variables:
 
 - `GEMINI_BASE_URL`: Override the Gemini API base URL (default: `https://generativelanguage.googleapis.com`)
 - `PORT`: Override the server port (default: `8080`)
+- `ENABLED_MODELS`: Curate the model list served by `/v1/models`. Comma-separated exact ids or glob patterns (`*` = any run, `?` = one character; case-insensitive). An all-static list (no wildcards) is served without contacting the upstream at all; patterns are expanded against the upstream list; if that request fails, only the static entries are served.
 
 Example:
 ```sh

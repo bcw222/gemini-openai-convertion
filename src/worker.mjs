@@ -30,7 +30,7 @@ export default {
             .catch(errHandler);
         case pathname.endsWith("/models"):
           assert(request.method === "GET");
-          return handleModels(apiKey, baseUrl)
+          return handleModels(apiKey, env, baseUrl)
             .catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
@@ -76,24 +76,95 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
-async function handleModels (apiKey, baseUrl) {
-  const response = await fetch(`${baseUrl}/${API_VERSION}/models`, {
-    headers: makeHeaders(apiKey),
-  });
-  let { body } = response;
-  if (response.ok) {
+const isPattern = (s) => /[*?]/.test(s);
+// "gemini-2.5-*" -> /^gemini-2\.5-.*$/i  (anchored, case-insensitive; `*` = any run, `?` = one char)
+const patternToRegExp = (p) => new RegExp(
+  "^" + p.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
+  "i",
+);
+
+const toModelEntry = (name) => ({
+  id: name.replace("models/", ""),
+  object: "model",
+  created: 0,
+  owned_by: "",
+});
+
+// Fetch and reshape the upstream model list; never throws.
+const requestUpstreamModels = async (apiKey, baseUrl) => {
+  try {
+    const response = await fetch(`${baseUrl}/${API_VERSION}/models`, {
+      headers: makeHeaders(apiKey),
+    });
+    if (!response.ok) {
+      return { ok: false, status: response.status };
+    }
     const { models } = JSON.parse(await response.text());
-    body = JSON.stringify({
-      object: "list",
-      data: models.map(({ name }) => ({
-        id: name.replace("models/", ""),
-        object: "model",
-        created: 0,
-        owned_by: "",
-      })),
-    }, null, "  ");
+    return { ok: true, models: (models ?? []).map(({ name }) => toModelEntry(name)) };
+  } catch (err) {
+    console.error("Error fetching upstream models:", err);
+    return { ok: false, status: 0 };
   }
-  return new Response(body, fixCors(response));
+};
+
+async function handleModels (apiKey, env, baseUrl) {
+  const spec = (env?.ENABLED_MODELS || process.env.ENABLED_MODELS || "").trim();
+  const entries = spec.split(",").map((s) => s.trim().replace("models/", "")).filter(Boolean);
+
+  if (!entries.length) {
+    // No allowlist configured -- serve the upstream list as is.
+    const response = await fetch(`${baseUrl}/${API_VERSION}/models`, {
+      headers: makeHeaders(apiKey),
+    });
+    let { body } = response;
+    if (response.ok) {
+      const { models } = JSON.parse(await response.text());
+      body = JSON.stringify({
+        object: "list",
+        data: models.map(({ name }) => toModelEntry(name)),
+      }, null, "  ");
+    }
+    return new Response(body, fixCors(response));
+  }
+
+  // Glob patterns need the upstream list to expand against -- an all-static
+  // allowlist is served without contacting the upstream at all.
+  let upstream = null;
+  if (entries.some(isPattern)) {
+    const result = await requestUpstreamModels(apiKey, baseUrl);
+    if (result.ok) {
+      upstream = result.models;
+    } else {
+      const reason = result.status ? `HTTP ${result.status}` : "request failed";
+      console.warn(`ENABLED_MODELS: upstream model list unavailable (${reason}); serving static entries only`);
+    }
+  }
+
+  const data = [];
+  const seen = new Set();
+  const push = (model) => {
+    if (model && !seen.has(model.id)) {
+      seen.add(model.id);
+      data.push(model);
+    }
+  };
+  for (const entry of entries) {
+    if (isPattern(entry)) {
+      if (!upstream) { continue; } // upstream unavailable -- patterns contribute nothing
+      const re = patternToRegExp(entry);
+      for (const model of upstream) {
+        if (re.test(model.id)) { push(model); }
+      }
+    } else {
+      push(upstream?.find((model) => model.id.toLowerCase() === entry.toLowerCase()) ?? toModelEntry(entry));
+    }
+  }
+  return new Response(JSON.stringify({ object: "list", data }, null, "  "), {
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "gemini-embedding-001";
