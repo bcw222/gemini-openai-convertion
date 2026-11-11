@@ -204,3 +204,26 @@ For more details, refer to the [Gemini API docs](https://ai.google.dev/gemini-ap
 - [x] `embeddings`
   - [x] `dimensions`
 - [x] `models`
+
+---
+
+## Usage mapping
+
+`usageMetadata` is re-shaped to the OpenAI / OpenRouter Chat Completions contract:
+
+| OpenAI field | Gemini source |
+| --- | --- |
+| `prompt_tokens` | `promptTokenCount` + `toolUsePromptTokenCount` (all input tokens; `promptTokenCount` already contains cached content) |
+| `completion_tokens` | `candidatesTokenCount` + `thoughtsTokenCount` |
+| `total_tokens` | `prompt_tokens` + `completion_tokens` (equal to `totalTokenCount`) |
+| `prompt_tokens_details.cached_tokens` | sum of `cacheTokensDetails[].tokenCount`, else `cachedContentTokenCount`, else `0` |
+| `prompt_tokens_details.audio_tokens` | `promptTokensDetails` entry with `modality: "AUDIO"` |
+| `completion_tokens_details.reasoning_tokens` | `thoughtsTokenCount` |
+| `completion_tokens_details.audio_tokens` | `candidatesTokensDetails` entry with `modality: "AUDIO"` |
+
+Cached tokens are part of `prompt_tokens`, never subtracted from it, and are
+reported separately in `prompt_tokens_details.cached_tokens`. Gemini reports no
+cache-write counter, so `cache_write_tokens` is never emitted.
+
+Streaming emits `usage` on the final chunk only when `stream_options.include_usage`
+is set, and it matches the non-stream shape field for field.

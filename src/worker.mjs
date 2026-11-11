@@ -624,24 +624,45 @@ function transformCandidates (key, cand) {
 
 const notEmpty = (el) => Object.values(el).some(Boolean) ? el : undefined;
 const sum = (...numbers) => numbers.reduce((total, num) => total + (num ?? 0), 0);
-const transformUsage = (data) => ({
-  completion_tokens: sum(data.candidatesTokenCount, data.toolUsePromptTokenCount, data.thoughtsTokenCount),
-  prompt_tokens: data.promptTokenCount,
-  total_tokens: data.totalTokenCount,
-  completion_tokens_details: notEmpty({
+
+// OpenRouter / OpenAI Chat Completions usage shape:
+//   prompt_tokens     = promptTokenCount + toolUsePromptTokenCount
+//                       (Gemini's promptTokenCount already contains cached content,
+//                        so cached tokens are NOT added again; tool results fed back
+//                        to the model are input tokens, not output)
+//   completion_tokens = candidatesTokenCount + thoughtsTokenCount
+//   total_tokens      = prompt_tokens + completion_tokens (== totalTokenCount)
+// Gemini has no cache-write counter, so cache_write_tokens is never emitted.
+const transformUsage = (data) => {
+  const prompt = sum(data.promptTokenCount, data.toolUsePromptTokenCount);
+  const completion = sum(data.candidatesTokenCount, data.thoughtsTokenCount);
+  const detailCached = data.cacheTokensDetails?.length
+    ? data.cacheTokensDetails.reduce((acc, el) => acc + (el.tokenCount ?? 0), 0)
+    : undefined;
+  const cached = detailCached ?? data.cachedContentTokenCount ?? 0;
+
+  const completion_details = notEmpty({
     audio_tokens: data.candidatesTokensDetails
       ?.find(el => el.modality === "AUDIO")
       ?.tokenCount,
     reasoning_tokens: data.thoughtsTokenCount,
-  }),
-  prompt_tokens_details: notEmpty({
-    audio_tokens: data.promptTokensDetails
-      ?.find(el => el.modality === "AUDIO")
-      ?.tokenCount,
-    cached_tokens: data.cacheTokensDetails
-      ?.reduce((acc,el) => acc + el.tokenCount, 0),
-  }),
-});
+  });
+
+  const prompt_details = { cached_tokens: cached };
+  const promptAudio = data.promptTokensDetails
+    ?.find(el => el.modality === "AUDIO")
+    ?.tokenCount;
+  if (promptAudio != null) { prompt_details.audio_tokens = promptAudio; }
+
+  const usage = {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: prompt_details,
+  };
+  if (completion_details) { usage.completion_tokens_details = completion_details; }
+  return usage;
+};
 
 const checkPromptBlock = (choices, promptFeedback, key) => {
   if (choices.length) { return; }
