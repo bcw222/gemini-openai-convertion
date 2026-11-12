@@ -303,24 +303,85 @@ async function handleCompletions (req, apiKey, baseUrl) {
   return new Response(body, fixCors(response));
 }
 
-const adjustProps = (schemaPart) => {
-  if (typeof schemaPart !== "object" || schemaPart === null) {
+// Gemini's Schema is a restricted subset of JSON Schema: unknown keywords are
+// rejected with HTTP 400. Verified against @google/genai v2.24.0 `interface Schema`.
+const schemaKeys = new Set([
+  "anyOf", "default", "description", "enum", "example", "format", "items",
+  "maxItems", "maxLength", "maxProperties", "maximum", "minItems", "minLength",
+  "minProperties", "minimum", "nullable", "pattern", "properties",
+  "propertyOrdering", "required", "title", "type",
+]);
+// `enum` is `repeated string` in the proto, so only string values can go in it.
+const adjustProps = (schema) => {
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+    return schema;
+  }
+  // const -> enum (string constants only); non-string const is dropped.
+  if ("const" in schema) {
+    if (typeof schema.const === "string" && !Array.isArray(schema.enum)) {
+      schema.enum = [schema.const];
+    }
+    delete schema.const;
+  }
+  // examples: [x] -> example: x
+  if (Array.isArray(schema.examples) && schema.examples.length > 0 && !("example" in schema)) {
+    schema.example = schema.examples[0];
+  }
+  // type: ["string", "null"] -> type: "string" + nullable: true
+  if (Array.isArray(schema.type)) {
+    const types = schema.type.filter(type => type !== "null");
+    if (types.length !== schema.type.length) {
+      schema.nullable = true;
+    }
+    if (types.length === 1) {
+      schema.type = types[0];
+    } else if (types.length > 1) {
+      delete schema.type;
+      schema.anyOf = types.map(type => ({ type }));
+    } else {
+      delete schema.type;
+    }
+  }
+  // Recurse only into schema-bearing children. `default`, `example` and `enum`
+  // hold instance data, not schemas, and must never be filtered.
+  if (schema.items) {
+    if (Array.isArray(schema.items)) {
+      schema.items.forEach(adjustProps);
+    } else {
+      adjustProps(schema.items);
+    }
+  }
+  if (schema.properties && typeof schema.properties === "object") {
+    Object.values(schema.properties).forEach(adjustProps);
+  }
+  if (Array.isArray(schema.anyOf)) {
+    schema.anyOf.forEach(adjustProps);
+  }
+  // Drop every keyword Gemini does not know about.
+  for (const key of Object.keys(schema)) {
+    if (!schemaKeys.has(key)) {
+      delete schema[key];
+    }
+  }
+  return schema;
+};
+const adjustSchema = (wrapper) => {
+  const obj = wrapper[wrapper.type];
+  if (!obj) {
     return;
   }
-  if (Array.isArray(schemaPart)) {
-    schemaPart.forEach(adjustProps);
-  } else {
-    if (schemaPart.type === "object" && schemaPart.properties && schemaPart.additionalProperties === false) {
-      delete schemaPart.additionalProperties;
-    }
-    Object.values(schemaPart).forEach(adjustProps);
-  }
-};
-const adjustSchema = (schema) => {
-  const obj = schema[schema.type];
   delete obj.strict;
-  delete obj.parameters?.$schema;
-  return adjustProps(schema);
+  if (obj.parameters) {
+    delete obj.parameters.$schema;
+    adjustProps(obj.parameters);
+  }
+  if (obj.response) {
+    adjustProps(obj.response);
+  }
+  if (obj.schema) {
+    delete obj.schema.$schema;
+    adjustProps(obj.schema);
+  }
 };
 
 const harmCategory = [
@@ -695,24 +756,45 @@ function transformCandidates (key, cand) {
 
 const notEmpty = (el) => Object.values(el).some(Boolean) ? el : undefined;
 const sum = (...numbers) => numbers.reduce((total, num) => total + (num ?? 0), 0);
-const transformUsage = (data) => ({
-  completion_tokens: sum(data.candidatesTokenCount, data.toolUsePromptTokenCount, data.thoughtsTokenCount),
-  prompt_tokens: data.promptTokenCount,
-  total_tokens: data.totalTokenCount,
-  completion_tokens_details: notEmpty({
+
+// OpenRouter / OpenAI Chat Completions usage shape:
+//   prompt_tokens     = promptTokenCount + toolUsePromptTokenCount
+//                       (Gemini's promptTokenCount already contains cached content,
+//                        so cached tokens are NOT added again; tool results fed back
+//                        to the model are input tokens, not output)
+//   completion_tokens = candidatesTokenCount + thoughtsTokenCount
+//   total_tokens      = prompt_tokens + completion_tokens (== totalTokenCount)
+// Gemini has no cache-write counter, so cache_write_tokens is never emitted.
+const transformUsage = (data) => {
+  const prompt = sum(data.promptTokenCount, data.toolUsePromptTokenCount);
+  const completion = sum(data.candidatesTokenCount, data.thoughtsTokenCount);
+  const detailCached = data.cacheTokensDetails?.length
+    ? data.cacheTokensDetails.reduce((acc, el) => acc + (el.tokenCount ?? 0), 0)
+    : undefined;
+  const cached = detailCached ?? data.cachedContentTokenCount ?? 0;
+
+  const completion_details = notEmpty({
     audio_tokens: data.candidatesTokensDetails
       ?.find(el => el.modality === "AUDIO")
       ?.tokenCount,
     reasoning_tokens: data.thoughtsTokenCount,
-  }),
-  prompt_tokens_details: notEmpty({
-    audio_tokens: data.promptTokensDetails
-      ?.find(el => el.modality === "AUDIO")
-      ?.tokenCount,
-    cached_tokens: data.cacheTokensDetails
-      ?.reduce((acc,el) => acc + el.tokenCount, 0),
-  }),
-});
+  });
+
+  const prompt_details = { cached_tokens: cached };
+  const promptAudio = data.promptTokensDetails
+    ?.find(el => el.modality === "AUDIO")
+    ?.tokenCount;
+  if (promptAudio != null) { prompt_details.audio_tokens = promptAudio; }
+
+  const usage = {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: prompt_details,
+  };
+  if (completion_details) { usage.completion_tokens_details = completion_details; }
+  return usage;
+};
 
 const checkPromptBlock = (choices, promptFeedback, key) => {
   if (choices.length) { return; }
