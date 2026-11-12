@@ -227,3 +227,41 @@ cache-write counter, so `cache_write_tokens` is never emitted.
 
 Streaming emits `usage` on the final chunk only when `stream_options.include_usage`
 is set, and it matches the non-stream shape field for field.
+
+## Tool schema compatibility
+
+Gemini's `Schema` (used for `tools[].function.parameters` and
+`response_format.json_schema.schema` → `generationConfig.responseSchema`) is a
+**restricted subset** of JSON Schema. Any keyword Gemini does not recognize is
+rejected with `400 Invalid JSON payload received. Unknown name "..."`, so the
+worker sanitizes every schema before forwarding it, and drops the unknown keys.
+This is a **lossy** conversion: constraints that only existed as unsupported
+keywords are weakened, not enforced.
+
+Kept keywords:
+
+`anyOf`, `default`, `description`, `enum`, `example`, `format`, `items`,
+`maxItems`, `maxLength`, `maxProperties`, `maximum`, `minItems`, `minLength`,
+`minProperties`, `minimum`, `nullable`, `pattern`, `properties`,
+`propertyOrdering`, `required`, `title`, `type`
+
+Rewrites:
+
+| Input | Output |
+| --- | --- |
+| `const: "foo"` (string) | `enum: ["foo"]`, `const` removed (an existing `enum` is kept) |
+| `const: 42` / `const: true` / object | `const` dropped — Gemini's `enum` is `repeated string` only |
+| `type: ["string", "null"]` | `type: "string"` + `nullable: true` |
+| `type: ["string", "integer"]` | `anyOf: [{type:"string"},{type:"integer"}]`, `type` removed |
+| `examples: [x, ...]` | `example: x` (only when `example` is absent) |
+| `strict`, `$schema`, `additionalProperties` | dropped |
+
+Also dropped: `$id`, `$defs`, `definitions`, `$ref`, `patternProperties`,
+`unevaluatedProperties`, `allOf`, `oneOf`, `not`, `if`, `then`, `else`,
+`dependentRequired`, `dependentSchemas`, `contains`, `prefixItems`,
+`exclusiveMinimum`, `exclusiveMaximum`, `readOnly`, `writeOnly`, `deprecated`,
+`$comment`.
+
+Rewrites and filtering only descend into schema-bearing children (`items`,
+`properties` values, `anyOf`). Instance data under `default`, `example` and the
+values inside `enum` is passed through untouched.

@@ -232,24 +232,85 @@ async function handleCompletions (req, apiKey, baseUrl) {
   return new Response(body, fixCors(response));
 }
 
-const adjustProps = (schemaPart) => {
-  if (typeof schemaPart !== "object" || schemaPart === null) {
+// Gemini's Schema is a restricted subset of JSON Schema: unknown keywords are
+// rejected with HTTP 400. Verified against @google/genai v2.24.0 `interface Schema`.
+const schemaKeys = new Set([
+  "anyOf", "default", "description", "enum", "example", "format", "items",
+  "maxItems", "maxLength", "maxProperties", "maximum", "minItems", "minLength",
+  "minProperties", "minimum", "nullable", "pattern", "properties",
+  "propertyOrdering", "required", "title", "type",
+]);
+// `enum` is `repeated string` in the proto, so only string values can go in it.
+const adjustProps = (schema) => {
+  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
+    return schema;
+  }
+  // const -> enum (string constants only); non-string const is dropped.
+  if ("const" in schema) {
+    if (typeof schema.const === "string" && !Array.isArray(schema.enum)) {
+      schema.enum = [schema.const];
+    }
+    delete schema.const;
+  }
+  // examples: [x] -> example: x
+  if (Array.isArray(schema.examples) && schema.examples.length > 0 && !("example" in schema)) {
+    schema.example = schema.examples[0];
+  }
+  // type: ["string", "null"] -> type: "string" + nullable: true
+  if (Array.isArray(schema.type)) {
+    const types = schema.type.filter(type => type !== "null");
+    if (types.length !== schema.type.length) {
+      schema.nullable = true;
+    }
+    if (types.length === 1) {
+      schema.type = types[0];
+    } else if (types.length > 1) {
+      delete schema.type;
+      schema.anyOf = types.map(type => ({ type }));
+    } else {
+      delete schema.type;
+    }
+  }
+  // Recurse only into schema-bearing children. `default`, `example` and `enum`
+  // hold instance data, not schemas, and must never be filtered.
+  if (schema.items) {
+    if (Array.isArray(schema.items)) {
+      schema.items.forEach(adjustProps);
+    } else {
+      adjustProps(schema.items);
+    }
+  }
+  if (schema.properties && typeof schema.properties === "object") {
+    Object.values(schema.properties).forEach(adjustProps);
+  }
+  if (Array.isArray(schema.anyOf)) {
+    schema.anyOf.forEach(adjustProps);
+  }
+  // Drop every keyword Gemini does not know about.
+  for (const key of Object.keys(schema)) {
+    if (!schemaKeys.has(key)) {
+      delete schema[key];
+    }
+  }
+  return schema;
+};
+const adjustSchema = (wrapper) => {
+  const obj = wrapper[wrapper.type];
+  if (!obj) {
     return;
   }
-  if (Array.isArray(schemaPart)) {
-    schemaPart.forEach(adjustProps);
-  } else {
-    if (schemaPart.type === "object" && schemaPart.properties && schemaPart.additionalProperties === false) {
-      delete schemaPart.additionalProperties;
-    }
-    Object.values(schemaPart).forEach(adjustProps);
-  }
-};
-const adjustSchema = (schema) => {
-  const obj = schema[schema.type];
   delete obj.strict;
-  delete obj.parameters?.$schema;
-  return adjustProps(schema);
+  if (obj.parameters) {
+    delete obj.parameters.$schema;
+    adjustProps(obj.parameters);
+  }
+  if (obj.response) {
+    adjustProps(obj.response);
+  }
+  if (obj.schema) {
+    delete obj.schema.$schema;
+    adjustProps(obj.schema);
+  }
 };
 
 const harmCategory = [
