@@ -652,7 +652,7 @@ const transformMessages = async (messages) => {
   }
   if (system_instruction) {
     if (!contents[0]?.parts.some(part => part.text)) {
-      contents.unshift({ role: "user", parts: { text: " " } });
+      contents.unshift({ role: "user", parts: [{ text: " " }] });
     }
   }
   //console.info(JSON.stringify(contents, 2));

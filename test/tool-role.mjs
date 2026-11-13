@@ -119,5 +119,22 @@ console.log("\n[trailing user text does not merge into tool responses]");
 
 console.log("\n" + passed + " assertions passed");
 
+console.log("\n[synthetic first content keeps parts an array]");
+{
+  const body = await send({
+    messages: [
+      { role: "system", content: "sys" },
+      { role: "assistant", content: null, tool_calls: [
+        { id: "call_a", type: "function", function: { name: "ping", arguments: "{}" } },
+      ] },
+      { role: "tool", tool_call_id: "call_a", content: '{"pong":true}' },
+    ],
+  });
+  const c0 = body.contents[0];
+  ok(Array.isArray(c0?.parts), "spacer content parts is an array, not an object");
+  ok(c0.parts[0]?.text === " ", "spacer content carries a blank text part");
+}
+
+console.log("\n" + passed + " assertions passed");
 upstream.close();
 process.exit(0);
