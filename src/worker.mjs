@@ -618,11 +618,15 @@ const transformMessages = async (messages) => {
       case "tool":
         // eslint-disable-next-line no-case-declarations
         let { role, parts } = contents[contents.length - 1] ?? {};
-        if (role !== "function") {
+        // Gemini validates Content.role and rejects "function" with 400;
+        // function responses must ride under "user". The ".calls"
+        // bookkeeping property marks contents created here, so consecutive
+        // tool results still merge while plain user messages do not.
+        if (role !== "user" || !Array.isArray(parts) || !("calls" in parts)) {
           const calls = parts?.calls;
           parts = []; parts.calls = calls;
           contents.push({
-            role: "function", // ignored
+            role: "user",
             parts
           });
         }
